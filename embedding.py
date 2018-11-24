@@ -1,25 +1,185 @@
+from multiprocessing import cpu_count
+
+import numpy as np
 from glove import Glove, Corpus
 from gensim.models import Word2Vec, FastText
 
-class SecWord2Vec(Word2Vec):
+from logger import EpochLogger
+from preprocessing import KeywordCorpusFactory
+from preprocessing import KeywordCorpusIterator
+
+
+epoch_logger = EpochLogger()
+
+class KeywordCorpusFactoryWord2VecMixin(Word2Vec, KeywordCorpusFactory): 
 
 	def __init__(
-		self, sentences=None, corpus_file=None, size=100, alpha=0.025, window=5, 
-		min_count=5, max_vocab_size=None, sample=0.001, seed=1, workers=3, min_alpha=0.0001, 
-		sg=0, hs=0, negative=5, ns_exponent=0.75, cbow_mean=1, iter=5, null_word=0, 
-		trim_rule=None, sorted_vocab=1, batch_words=10000, compute_loss=False, max_final_vocab=None):
-
-		super().__init__( 
-			sentences=sentences, corpus_file=corpus_file, size=size, 
+		self, keywords, sentences, 
+		corpus_worker, corpus_chunksize, case_sensitive, 
+		corpus_file, size, alpha, 
+		window, min_count, max_vocab_size, 
+		sample, seed, workers, 
+		min_alpha, sg, hs, 
+		negative, ns_exponent, cbow_mean, 
+		iter, null_word, trim_rule, 
+		sorted_vocab, batch_words, compute_loss, 
+		max_final_vocab):
+		
+		KeywordCorpusFactory.__init__(self, keywords, case_sensitive)
+		self.kc = self.create(sentences, corpus_chunksize, corpus_worker)
+		self.kv = dict(((keyword, []) for keyword in self.kc.keys()))
+		self.corpus_worker = corpus_worker
+		self.corpus_chunksize = corpus_chunksize
+		
+		Word2Vec.__init__(
+			self, 
+			corpus_file=corpus_file, size=size, 
 			alpha=alpha, window=window, min_count=min_count,
 			max_vocab_size=max_vocab_size, sample=sample, seed=seed, 
 			workers=workers, min_alpha=min_alpha, sg=sg, 
 			hs=hs, negative=negative, ns_exponent=ns_exponent, 
 			cbow_mean=cbow_mean, iter=iter, null_word=null_word, 
 			trim_rule=trim_rule, sorted_vocab=sorted_vocab, batch_words=batch_words, 
-			compute_loss=compute_loss, max_final_vocab=max_final_vocab)
+			compute_loss=compute_loss, max_final_vocab=max_final_vocab,
+			callbacks=[epoch_logger])
 
-class SecFastText(FastText):
+	def __getitem__(self, word):
+		return self.wv[word]
+		
+
+class KeywordCorpusFactoryFasttextMixin(FastText, KeywordCorpusFactory): 
+
+	def __init__(
+		self, keywords, sentences, 
+		corpus_worker, corpus_chunksize, case_sensitive,
+		window=5, min_count=5, max_vocab_size=None, 
+		sample=0.001, seed=1, workers=cpu_count(), 
+		min_alpha=0.0001, sg=0, hs=0, 
+		negative=5, ns_exponent=0.75, cbow_mean=1, 
+		iter=5, null_word=0, trim_rule=None, 
+		sorted_vocab=1, batch_words=10000, compute_loss=False, 
+		max_final_vocab=None):
+
+		KeywordCorpusFactory.__init__(self, keywords, case_sensitive)
+		self.kc = self.create(sentences, corpus_chunksize, corpus_worker)
+		self.kv = dict(((keyword, []) for keyword in self.kc.keys()))
+		self.corpus_worker = corpus_worker
+		self.corpus_chunksize = corpus_chunksize
+
+		FastText.__init__(self, 
+			window, min_count, max_vocab_size, 
+			sample, seed, workers, 
+			min_alpha, sg, hs, 
+			negative, ns_exponent, cbow_mean, 
+			iter, null_word, trim_rule, 
+			sorted_vocab, batch_words, compute_loss, 
+			max_final_vocab)
+
+	def __getitem__(self, word):
+		return self.wv[word]
+
+
+class SecWord2Vec(KeywordCorpusFactoryWord2VecMixin):
+
+	def __init__(
+		self, keywords, sentences, 
+		corpus_worker=3, corpus_chunksize=256, case_sensitive=False, 
+		corpus_file=None, size=100, alpha=0.025, 
+		window=5, min_count=5, max_vocab_size=None, 
+		sample=0.001, seed=1, workers=cpu_count(), 
+		min_alpha=0.0001, sg=0, hs=0, 
+		negative=5, ns_exponent=0.75, cbow_mean=1, 
+		iter=5, null_word=0, trim_rule=None, 
+		sorted_vocab=1, batch_words=10000, compute_loss=False, 
+		max_final_vocab=None):
+		
+		super().__init__( 
+			keywords, sentences, corpus_worker, 
+			corpus_chunksize, case_sensitive, corpus_file, 
+			size, alpha, window, 
+			min_count, max_vocab_size, sample, 
+			seed, workers, min_alpha, 
+			sg, hs, negative, 
+			ns_exponent, cbow_mean, iter, 
+			null_word, trim_rule, sorted_vocab,
+			batch_words, compute_loss, max_final_vocab)
+
+		self.build_vocab(
+			(token for tokens in KeywordCorpusIterator(self.kc) 
+				for token in tokens))
+
+
+
+	def _get_vec(self, token):
+
+		if token in self.wv:
+			return self.wv[token]
+		else:
+			return self.wv['unk']
+
+	def _cal_kv(self):
+
+		for keyword, tokens_collection in self.kc.items():
+
+			kv = None
+			word_count = 0
+
+			for tokens_list in tokens_collection:
+
+				for tokens in tokens_list:
+
+					for token in tokens:
+
+						if word_count: 
+							kv = kv + self._get_vec(token)
+						else:
+							kv = self._get_vec(token)
+
+						word_count += 1
+
+				kv = kv / word_count
+				self.kv[keyword] = kv
+
+	def train_embed(
+		self, keywords=None, sentences=None, corpus_file=None, update=False,
+		total_examples=None, total_words=None,  epochs=None, 
+		start_alpha=None, end_alpha=None, word_count=0, 
+		queue_factor=2, report_delay=1.0, compute_loss=False):
+
+		epochs = epochs if epochs else self.epochs
+		total_examples = total_examples if total_examples else self.corpus_count
+
+		if update:
+
+			self.build_vocab(sentences, update=update)
+
+			# TODO: Update new keyword and its new corpus
+			# if keywords:
+			# 	for keyword in keywords:
+			# 		if keyword not in 
+
+			# update_keyword_corpus = self.create()
+
+			self.train(
+				sentences, corpus_file, 
+				total_examples, total_words, epochs, 
+				start_alpha, end_alpha, word_count, 
+				queue_factor, report_delay, compute_loss)
+		else:
+
+			self.train(
+				(token for tokens in KeywordCorpusIterator(self.kc)
+					for token in tokens), 
+				corpus_file, total_examples, total_words, epochs, 
+				start_alpha, end_alpha, word_count, 
+				queue_factor, report_delay, compute_loss)
+
+			self.wv['unk'] = np.random.uniform(-1, 1, (self.vector_size,))
+
+		self._cal_kv()
+
+
+class SecFastText(KeywordCorpusFactoryFasttextMixin):
 
 	def __init__(
 		self, sentences=None, corpus_file=None, 
@@ -42,9 +202,38 @@ class SecFastText(FastText):
 			null_word=null_word, min_n=min_n, max_n=max_n, sorted_vocab=sorted_vocab, 
 			bucket=bucket, trim_rule=trim_rule, batch_words=batch_words)
 
+		self.build_vocab(
+			(token for tokens in KeywordCorpusIterator(self.kc) 
+				for token in tokens))
 
 
-	
+	def train_embed(
+		self, sentences=None, corpus_file=None, update=False,
+		total_examples=None, total_words=None,  epochs=None, 
+		start_alpha=None, end_alpha=None, word_count=0, 
+		queue_factor=2, report_delay=1.0):
+
+		epochs = epochs if epochs else self.epochs
+		total_examples = total_examples if total_examples else self.corpus_count
+
+		if update:
+
+			self.build_vocab(sentences, update=update)
+			self.train(
+				sentences, corpus_file, 
+				total_examples, total_words, epochs, 
+				start_alpha, end_alpha, word_count, 
+				queue_factor, report_delay, compute_loss)
+
+		else:
+
+			self.train(
+				(token for tokens in KeywordCorpusIterator(self.kc)
+					for token in tokens),
+				corpus_file, 
+				total_examples, total_words, epochs, 
+				start_alpha, end_alpha, word_count, 
+				queue_factor, report_delay, compute_loss)
 
 class SecGloVe(Glove):
 
